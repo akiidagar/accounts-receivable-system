@@ -1,0 +1,824 @@
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-change-in-production';
+
+// Security middleware
+app.use(helmet());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW) || 15 * 60 * 1000, // 15 minutes
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
+  message: { error: 'Too many requests from this IP, please try again later.' }
+});
+app.use('/api/', limiter);
+
+// CORS configuration
+const corsOptions = {
+  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+app.use(cors(corsOptions));
+
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Initialize SQLite Database
+const dbPath = process.env.DB_PATH || path.join(__dirname, '../data/accounts_receivable.db');
+const db = new sqlite3.Database(dbPath);
+
+// Create tables and initial data
+db.serialize(() => {
+  // Users table for finance managers
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      role TEXT DEFAULT 'finance_manager',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_login DATETIME
+    )
+  `);
+
+  // Invoices table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS invoices (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      invoice_id TEXT UNIQUE NOT NULL,
+      customer_name TEXT NOT NULL,
+      customer_email TEXT NOT NULL,
+      customer_phone TEXT,
+      invoice_date TEXT NOT NULL,
+      due_date TEXT NOT NULL,
+      amount_due REAL NOT NULL,
+      payment_status TEXT DEFAULT 'pending',
+      payment_link TEXT,
+      notes TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Payments table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      invoice_id TEXT NOT NULL,
+      amount REAL NOT NULL,
+      payment_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+      payment_method TEXT DEFAULT 'online',
+      transaction_id TEXT,
+      status TEXT DEFAULT 'completed',
+      FOREIGN KEY (invoice_id) REFERENCES invoices (invoice_id)
+    )
+  `);
+
+  // Audit log table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      action TEXT NOT NULL,
+      table_name TEXT,
+      record_id TEXT,
+      old_values TEXT,
+      new_values TEXT,
+      ip_address TEXT,
+      user_agent TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Create indexes for better performance
+  db.run('CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(payment_status)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_name)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id)');
+
+  // Create default finance manager user
+  const defaultPassword = process.env.DEFAULT_ADMIN_PASSWORD || 'admin123';
+  const hashedPassword = bcrypt.hashSync(defaultPassword, parseInt(process.env.BCRYPT_ROUNDS) || 12);
+  
+  db.run(`
+    INSERT OR IGNORE INTO users (username, password, role) 
+    VALUES ('admin', ?, 'finance_manager')
+  `, [hashedPassword], function(err) {
+    if (err) {
+      console.error('Error creating default user:', err);
+    } else if (this.changes > 0) {
+      console.log('Default admin user created');
+    }
+  });
+});
+
+// Middleware to log requests
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip}`);
+  next();
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      console.log('Token verification failed:', err.message);
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Audit logging function
+const logAudit = (userId, action, tableName, recordId, oldValues, newValues, req) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('User-Agent') || '';
+  
+  db.run(`
+    INSERT INTO audit_log (user_id, action, table_name, record_id, old_values, new_values, ip_address, user_agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [userId, action, tableName, recordId, JSON.stringify(oldValues), JSON.stringify(newValues), ip, userAgent]);
+};
+
+// Routes
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  const healthCheck = {
+    uptime: process.uptime(),
+    message: 'OK',
+    timestamp: Date.now(),
+    environment: process.env.NODE_ENV || 'development',
+    version: '1.0.0'
+  };
+  
+  // Test database connection
+  db.get('SELECT 1 as test', (err, row) => {
+    if (err) {
+      healthCheck.database = 'disconnected';
+      healthCheck.message = 'Database connection failed';
+      return res.status(503).json(healthCheck);
+    }
+    
+    healthCheck.database = 'connected';
+    res.status(200).json(healthCheck);
+  });
+});
+
+// Authentication endpoints
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+
+  // Input validation
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+
+  if (username.length > 50 || password.length > 100) {
+    return res.status(400).json({ error: 'Invalid input length' });
+  }
+
+  db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
+    if (err) {
+      console.error('Database error during login:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!user) {
+      // Use same timing as bcrypt to prevent timing attacks
+      bcrypt.compare(password, '$2a$12$dummy.hash.to.prevent.timing.attacks');
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const isValidPassword = bcrypt.compareSync(password, user.password);
+    if (!isValidPassword) {
+      logAudit(user.id, 'FAILED_LOGIN', 'users', user.id, null, { username }, req);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Update last login
+    db.run('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', [user.id]);
+
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        username: user.username, 
+        role: user.role 
+      },
+      JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
+    );
+
+    logAudit(user.id, 'LOGIN', 'users', user.id, null, { username }, req);
+
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role
+      }
+    });
+  });
+});
+
+// Invoice endpoints
+app.post('/api/invoices', authenticateToken, (req, res) => {
+  const {
+    customer_name,
+    customer_email,
+    customer_phone,
+    invoice_date,
+    due_date,
+    amount_due,
+    notes
+  } = req.body;
+
+  // Input validation
+  if (!customer_name || !customer_email || !invoice_date || !due_date || !amount_due) {
+    return res.status(400).json({ error: 'Customer information is required' });
+  }
+
+  if (amount_due <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero' });
+  }
+
+  // Email validation
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(customer_email)) {
+    return res.status(400).json({ error: 'Valid email address required' });
+  }
+
+  // Date validation
+  const invoiceDate = new Date(invoice_date);
+  const dueDate = new Date(due_date);
+  if (dueDate <= invoiceDate) {
+    return res.status(400).json({ error: 'Due date must be after invoice date' });
+  }
+
+  const invoice_id = `INV-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+  const payment_link = `http://localhost:3000/payment/${invoice_id}`;
+
+  const invoiceData = {
+    invoice_id,
+    customer_name: customer_name.trim(),
+    customer_email: customer_email.trim().toLowerCase(),
+    customer_phone: customer_phone ? customer_phone.trim() : null,
+    invoice_date,
+    due_date,
+    amount_due: parseFloat(amount_due),
+    payment_link,
+    notes: notes ? notes.trim() : null
+  };
+
+  db.run(`
+    INSERT INTO invoices (
+      invoice_id, customer_name, customer_email, customer_phone,
+      invoice_date, due_date, amount_due, payment_link, notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    invoiceData.invoice_id,
+    invoiceData.customer_name,
+    invoiceData.customer_email,
+    invoiceData.customer_phone,
+    invoiceData.invoice_date,
+    invoiceData.due_date,
+    invoiceData.amount_due,
+    invoiceData.payment_link,
+    invoiceData.notes
+  ], function(err) {
+    if (err) {
+      console.error('Error creating invoice:', err);
+      return res.status(500).json({ error: 'Failed to create invoice' });
+    }
+
+    logAudit(req.user.id, 'CREATE', 'invoices', invoice_id, null, invoiceData, req);
+
+    res.status(201).json({
+      message: `Invoice ${invoice_id} was created successfully`,
+      invoice: {
+        id: this.lastID,
+        ...invoiceData,
+        payment_status: 'pending'
+      }
+    });
+  });
+});
+
+app.get('/api/invoices', authenticateToken, (req, res) => {
+  const { search, status, page = 1, limit = 50 } = req.query;
+  
+  let query = 'SELECT * FROM invoices WHERE 1=1';
+  let countQuery = 'SELECT COUNT(*) as total FROM invoices WHERE 1=1';
+  let params = [];
+
+  if (search) {
+    const searchCondition = ' AND (invoice_id LIKE ? OR customer_name LIKE ? OR customer_email LIKE ?)';
+    const searchParam = `%${search}%`;
+    query += searchCondition;
+    countQuery += searchCondition;
+    params.push(searchParam, searchParam, searchParam);
+  }
+
+  if (status && status !== 'all') {
+    query += ' AND payment_status = ?';
+    countQuery += ' AND payment_status = ?';
+    params.push(status);
+  }
+
+  // Get total count
+  db.get(countQuery, params, (err, countResult) => {
+    if (err) {
+      console.error('Error counting invoices:', err);
+      return res.status(500).json({ error: 'Failed to count invoices' });
+    }
+
+    // Add pagination
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), offset);
+
+    db.all(query, params, (err, invoices) => {
+      if (err) {
+        console.error('Error fetching invoices:', err);
+        return res.status(500).json({ error: 'Failed to fetch invoices' });
+      }
+
+      res.json({
+        invoices,
+        pagination: {
+          total: countResult.total,
+          page: parseInt(page),
+          limit: parseInt(limit),
+          totalPages: Math.ceil(countResult.total / parseInt(limit))
+        }
+      });
+    });
+  });
+});
+
+app.get('/api/invoices/:invoice_id', (req, res) => {
+  const { invoice_id } = req.params;
+
+  if (!invoice_id || !/^INV-\d+-[A-Z0-9]+$/.test(invoice_id)) {
+    return res.status(400).json({ error: 'Invalid invoice ID format' });
+  }
+
+  db.get('SELECT * FROM invoices WHERE invoice_id = ?', [invoice_id], (err, invoice) => {
+    if (err) {
+      console.error('Error fetching invoice:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!invoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    res.json(invoice);
+  });
+});
+
+
+// Update invoice endpoint
+app.put('/api/invoices/:invoice_id', authenticateToken, (req, res) => {
+  const { invoice_id } = req.params;
+  const {
+    customer_name,
+    customer_email,
+    customer_phone,
+    invoice_date,
+    due_date,
+    amount_due,
+    notes
+  } = req.body;
+
+  if (!invoice_id || !/^INV-\d+-[A-Z0-9]+$/.test(invoice_id)) {
+    return res.status(400).json({ error: 'Invalid invoice ID format' });
+  }
+
+  if (!customer_name || !customer_email || !invoice_date || !due_date || !amount_due) {
+    return res.status(400).json({ error: 'All required fields must be provided' });
+  }
+
+  if (amount_due <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero' });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(customer_email)) {
+    return res.status(400).json({ error: 'Valid email address required' });
+  }
+
+  db.get('SELECT * FROM invoices WHERE invoice_id = ?', [invoice_id], (err, existingInvoice) => {
+    if (err) {
+      console.error('Error fetching invoice for update:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!existingInvoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (existingInvoice.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Cannot edit paid invoices' });
+    }
+
+    const updatedData = {
+      customer_name: customer_name.trim(),
+      customer_email: customer_email.trim().toLowerCase(),
+      customer_phone: customer_phone ? customer_phone.trim() : null,
+      invoice_date,
+      due_date,
+      amount_due: parseFloat(amount_due),
+      notes: notes ? notes.trim() : null
+    };
+
+    db.run(`
+      UPDATE invoices SET 
+        customer_name = ?, customer_email = ?, customer_phone = ?,
+        invoice_date = ?, due_date = ?, amount_due = ?, notes = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE invoice_id = ?
+    `, [
+      updatedData.customer_name,
+      updatedData.customer_email,
+      updatedData.customer_phone,
+      updatedData.invoice_date,
+      updatedData.due_date,
+      updatedData.amount_due,
+      updatedData.notes,
+      invoice_id
+    ], function(err) {
+      if (err) {
+        console.error('Error updating invoice:', err);
+        return res.status(500).json({ error: 'Failed to update invoice' });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Invoice not found' });
+      }
+
+      res.json({
+        message: `Invoice ${invoice_id} updated successfully`,
+        invoice: {
+          ...existingInvoice,
+          ...updatedData
+        }
+      });
+    });
+  });
+});
+// Delete invoice endpoint (ADDED IN CORRECT POSITION)
+app.delete('/api/invoices/:invoice_id', authenticateToken, (req, res) => {
+  const { invoice_id } = req.params;
+
+  if (!invoice_id || !/^INV-\d+-[A-Z0-9]+$/.test(invoice_id)) {
+    return res.status(400).json({ error: 'Invalid invoice ID format' });
+  }
+
+  db.get('SELECT * FROM invoices WHERE invoice_id = ?', [invoice_id], (err, invoice) => {
+    if (err) {
+      console.error('Error fetching invoice for deletion:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!invoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    // Prevent deletion of paid invoices
+    if (invoice.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Cannot delete paid invoices' });
+    }
+
+    db.run('DELETE FROM invoices WHERE invoice_id = ?', [invoice_id], function(err) {
+      if (err) {
+        console.error('Error deleting invoice:', err);
+        return res.status(500).json({ error: 'Failed to delete invoice' });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Invoice not found' });
+      }
+
+      console.log(`Invoice ${invoice_id} deleted by user ${req.user.username}`);
+      
+      res.json({
+        message: `Invoice ${invoice_id} deleted successfully`,
+        invoice_id
+      });
+    });
+  });
+});
+
+// Payment processing
+app.post('/api/payments/:invoice_id', (req, res) => {
+  const { invoice_id } = req.params;
+  const { amount, payment_method = 'online' } = req.body;
+
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ error: 'Valid payment amount required' });
+  }
+
+  if (!invoice_id || !/^INV-\d+-[A-Z0-9]+$/.test(invoice_id)) {
+    return res.status(400).json({ error: 'Invalid invoice ID format' });
+  }
+
+  // Get the invoice
+  db.get('SELECT * FROM invoices WHERE invoice_id = ?', [invoice_id], (err, invoice) => {
+    if (err) {
+      console.error('Error fetching invoice for payment:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!invoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (invoice.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Invoice already paid' });
+    }
+
+    // Check if due date has passed
+    const currentDate = new Date();
+    const dueDate = new Date(invoice.due_date);
+    if (currentDate > dueDate) {
+      return res.status(400).json({ error: 'Payment link has expired' });
+    }
+
+    // Verify payment amount matches invoice amount
+    if (Math.abs(parseFloat(amount) - parseFloat(invoice.amount_due)) > 0.01) {
+      return res.status(400).json({ error: 'Payment amount does not match invoice amount' });
+    }
+
+    // Process payment (simulate for demo)
+    const transaction_id = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+
+    db.run('BEGIN TRANSACTION');
+
+    // Insert payment record
+    db.run(`
+      INSERT INTO payments (invoice_id, amount, payment_method, transaction_id, status)
+      VALUES (?, ?, ?, ?, 'completed')
+    `, [invoice_id, amount, payment_method, transaction_id], function(err) {
+      if (err) {
+        db.run('ROLLBACK');
+        console.error('Error inserting payment:', err);
+        return res.status(500).json({ error: 'Payment processing failed' });
+      }
+
+      const payment_id = this.lastID;
+
+      // Update invoice status
+      db.run(`
+        UPDATE invoices SET payment_status = 'paid', updated_at = CURRENT_TIMESTAMP 
+        WHERE invoice_id = ?
+      `, [invoice_id], (err) => {
+        if (err) {
+          db.run('ROLLBACK');
+          console.error('Error updating invoice:', err);
+          return res.status(500).json({ error: 'Failed to update invoice status' });
+        }
+
+        db.run('COMMIT');
+
+        // Log the payment
+        logAudit(null, 'PAYMENT', 'payments', payment_id, null, {
+          invoice_id,
+          amount,
+          transaction_id
+        }, req);
+
+        res.json({
+          message: `Payment of $${amount} for Invoice ${invoice_id} completed successfully`,
+          payment: {
+            id: payment_id,
+            invoice_id,
+            amount: parseFloat(amount),
+            transaction_id,
+            status: 'completed',
+            payment_date: new Date().toISOString()
+          }
+        });
+      });
+    });
+  });
+});
+
+// Payment link generation
+app.post('/api/invoices/:invoice_id/payment-link', authenticateToken, (req, res) => {
+  const { invoice_id } = req.params;
+  const payment_link = `http://localhost:3000/payment/${invoice_id}`;
+
+  db.run(`
+    UPDATE invoices SET payment_link = ?, updated_at = CURRENT_TIMESTAMP 
+    WHERE invoice_id = ? AND payment_status = 'pending'
+  `, [payment_link, invoice_id], function(err) {
+    if (err) {
+      console.error('Error generating payment link:', err);
+      return res.status(500).json({ error: 'Failed to generate payment link' });
+    }
+
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Invoice not found or already paid' });
+    }
+
+    logAudit(req.user.id, 'GENERATE_LINK', 'invoices', invoice_id, null, { payment_link }, req);
+
+    res.json({
+      message: 'Payment link generated successfully',
+      payment_link
+    });
+  });
+});
+
+// Dashboard statistics
+app.get('/api/dashboard/stats', authenticateToken, (req, res) => {
+  const queries = {
+    total: 'SELECT COUNT(*) as count FROM invoices',
+    pending: 'SELECT COUNT(*) as count FROM invoices WHERE payment_status = "pending"',
+    paid: 'SELECT COUNT(*) as count FROM invoices WHERE payment_status = "paid"',
+    totalAmount: 'SELECT SUM(amount_due) as total FROM invoices',
+    totalPaid: 'SELECT SUM(amount_due) as total FROM invoices WHERE payment_status = "paid"',
+    recentPayments: `
+      SELECT COUNT(*) as count FROM payments 
+      WHERE payment_date >= datetime('now', '-7 days')
+    `
+  };
+
+  const stats = {};
+  let completed = 0;
+  const totalQueries = Object.keys(queries).length;
+
+  Object.entries(queries).forEach(([key, query]) => {
+    db.get(query, (err, result) => {
+      if (!err) {
+        stats[key] = result.count !== undefined ? result.count : (result.total || 0);
+      }
+      
+      completed++;
+      if (completed === totalQueries) {
+        res.json(stats);
+      }
+    });
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    ...(process.env.NODE_ENV === 'development' && { details: err.message })
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('Received SIGINT. Graceful shutdown...');
+  db.close((err) => {
+    if (err) {
+      console.error('Error closing database:', err);
+    } else {
+      console.log('Database connection closed.');
+    }
+    process.exit(0);
+  });
+});
+
+// Start server
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Database: ${dbPath}`);
+  console.log(`Health check: http://localhost:${PORT}/api/health`);
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`Default login - Username: admin, Password: ${process.env.DEFAULT_ADMIN_PASSWORD || 'admin123'}`);
+  }
+});
+
+module.exports = app;
+
+// Update invoice endpoint
+app.put('/api/invoices/:invoice_id', authenticateToken, (req, res) => {
+  const { invoice_id } = req.params;
+  const {
+    customer_name,
+    customer_email,
+    customer_phone,
+    invoice_date,
+    due_date,
+    amount_due,
+    notes
+  } = req.body;
+
+  if (!invoice_id || !/^INV-\d+-[A-Z0-9]+$/.test(invoice_id)) {
+    return res.status(400).json({ error: 'Invalid invoice ID format' });
+  }
+
+  // Input validation
+  if (!customer_name || !customer_email || !invoice_date || !due_date || !amount_due) {
+    return res.status(400).json({ error: 'All required fields must be provided' });
+  }
+
+  if (amount_due <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero' });
+  }
+
+  // Email validation
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(customer_email)) {
+    return res.status(400).json({ error: 'Valid email address required' });
+  }
+
+  // Get existing invoice first
+  db.get('SELECT * FROM invoices WHERE invoice_id = ?', [invoice_id], (err, existingInvoice) => {
+    if (err) {
+      console.error('Error fetching invoice for update:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!existingInvoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    // Prevent editing paid invoices
+    if (existingInvoice.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Cannot edit paid invoices' });
+    }
+
+    const updatedData = {
+      customer_name: customer_name.trim(),
+      customer_email: customer_email.trim().toLowerCase(),
+      customer_phone: customer_phone ? customer_phone.trim() : null,
+      invoice_date,
+      due_date,
+      amount_due: parseFloat(amount_due),
+      notes: notes ? notes.trim() : null
+    };
+
+    db.run(`
+      UPDATE invoices SET 
+        customer_name = ?, customer_email = ?, customer_phone = ?,
+        invoice_date = ?, due_date = ?, amount_due = ?, notes = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE invoice_id = ?
+    `, [
+      updatedData.customer_name,
+      updatedData.customer_email,
+      updatedData.customer_phone,
+      updatedData.invoice_date,
+      updatedData.due_date,
+      updatedData.amount_due,
+      updatedData.notes,
+      invoice_id
+    ], function(err) {
+      if (err) {
+        console.error('Error updating invoice:', err);
+        return res.status(500).json({ error: 'Failed to update invoice' });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Invoice not found' });
+      }
+
+      logAudit(req.user.id, 'UPDATE', 'invoices', invoice_id, existingInvoice, updatedData, req);
+
+      res.json({
+        message: `Invoice ${invoice_id} updated successfully`,
+        invoice: {
+          ...existingInvoice,
+          ...updatedData
+        }
+      });
+    });
+  });
+});
